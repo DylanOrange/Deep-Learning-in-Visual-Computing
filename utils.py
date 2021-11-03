@@ -3,7 +3,7 @@ import numpy as np
 import math
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-
+from tools.fusion import rigid_transform
 
 def save_checkpoint(state, filename="my_checkpoint.pth.tar"):
     print("=> Saving checkpoint")
@@ -23,117 +23,80 @@ def visualization(cube,alpha):
     filled = np.ones(spatial_axes, dtype=bool)
     alpha = 0.7
     colors = np.empty(spatial_axes + [4], dtype=np.float32)
+    cube = cube.reshape(64,64,64,3)
     colors[:, :, :, :-1] = cube
     colors[:, :, :, -1] = alpha
     #fig = plt.figure()
     ax = plt.figure().add_subplot(projection='3d')
     ax.voxels(filled, facecolors=colors, edgecolors='k')
     plt.show()
+def vox2world(vol_origin, vox_coords, vox_size):  # convert voxel grid coordinates to world coordinates
+    # vol_origin: (3,)
+    # vol_coords:(N,3)
+    vol_origin = vol_origin.astype(np.float32)
+    vox_coords = vox_coords.astype(np.float32)
+    cam_pts = np.empty_like(vox_coords, dtype=np.float32)
+    for i in range(vox_coords.shape[0]):
+        for j in range(3):
+            cam_pts[i, j] = vol_origin[j] + (vox_size * vox_coords[i, j])
+    return cam_pts
+
+def cam2pix(cam_pts, intrmat):  # convert camera coordiantes to pixel coordiantes
+    # cam_pts:(N,3)
+    #print('shape of cam_pts{}'.format(cam_pts.shape))
+    intrmat = intrmat.astype(np.float32)  # intr [ fx 0 ox;0 fy oy; 0 0 1]
+    fx, fy = intrmat[0, 0], intrmat[1, 1],
+    ox, oy = intrmat[0, 2], intrmat[1, 2],
+    pix = np.empty((cam_pts.shape[0], 2), dtype=np.int64)  # (N,2)
+    #print("shape of pix:{}".format(pix.shape))
+    for i in range(cam_pts.shape[0]):
+        pix[i, 0] = int((np.round(cam_pts[i, 0] * fx) / cam_pts[i, 2]) + ox)  # u = fx*X/Z + ox
+        pix[i, 1] = int((np.round(cam_pts[i, 1] * fx) / cam_pts[i, 2]) + oy)  # v = fy*Y/Z + oy
+    return pix
+
+def get_CVC(color_im,cam_intr,cam_pose,vol_bonds, voxel_size,voxel_dim = 64):
+    # initialization of cube
+    vol_dim = np.array([3,voxel_dim,voxel_dim,voxel_dim])
+    vol_origin =vol_bonds[:,0]
+
+    # Initialize tsdf_vol and weight_vol
+    cvc = np.zeros((vol_dim))  #(3,64,64,64)
+
+    # get voxel grid coordiantes
+    xv, yv, zv = np.meshgrid(range(vol_dim[1]),
+                             range(vol_dim[2]),
+                             range(vol_dim[3]),
+                             indexing='ij')
+    vox_coords = np.concatenate([xv.reshape(1, -1), yv.reshape(1, -1), zv.reshape(1, -1)], axis=0).astype(int)
+    vox_coords = vox_coords.T  #(N,3)
+    #print("shape of vox_coords:{}".format(vox_coords.shape))
+    im_h, im_w ,_= color_im.shape
+
+    cam_pts = vox2world(vol_origin, vox_coords,voxel_size)  # coordinates of voxel in World coordinate (N,3)
+    cam_pts = rigid_transform(cam_pts, np.linalg.inv(cam_pose))  # world coordiante -> camera coordiante
+    pix_z = cam_pts[:, 2]
+    pix = cam2pix(cam_pts, cam_intr)
+    #print("shape of pix:{}".format(pix.shape))
+    pix_x, pix_y = pix[:, 0], pix[:, 1]  #(N,) (N,)
+
+    # eliminate pixels outside view frustum
+    valid_pix = np.logical_and(pix_x >= 0,
+                               np.logical_and(pix_x < im_w,
+                                              np.logical_and(pix_y > 0,
+                                                             np.logical_and(pix_y < im_h,
+                                                                            pix_z > 0))))
+
+    rgb_val = np.zeros((len(pix_x),3))  #(N,3)
+    rgb_val[valid_pix] = color_im[pix_y[valid_pix], pix_x[valid_pix]]
+    rgb_val_valid = rgb_val[valid_pix]
+    #print("shape of rgb_val_valid:{}".format(rgb_val_valid.shape))
+    valid_vox_x = vox_coords[
+        valid_pix, 0]  # vox_coords have already been considered voxel_size, (N,),(N,),(N,)
+    valid_vox_y = vox_coords[
+        valid_pix, 1]  # vox_coords have already been considered voxel_size, (N,),(N,),(N,)
+    valid_vox_z = vox_coords[
+        valid_pix, 2]  # vox_coords have already been considered voxel_size, (N,),(N,),(N,)
+    cvc[:,valid_vox_x,valid_vox_y,valid_vox_z] = rgb_val_valid.reshape(3,-1)
+    return cvc
 
 
-def initializeCubes(resol, cube_D, cube_Dcenter, cube_overlapping_ratio, BB):
-    # generate {N_cubes} 3D overlapping cubes, each one has {N_cubeParams} embeddings
-    # for the cube with size of cube_D^3 the valid prediction region is the center part, say, cube_Dcenter^3
-    # E.g. cube_D=32, cube_Dcenter could be = 20. Because the border part of each cubes don't have accurate prediction because of ConvNet.
-    #
-    # ---------------
-    # inputs:
-    #     resol: resolusion of each voxel in the CVC (mm)
-    #     cube_D: size of the CVC (Colored Voxel Cube)
-    #     cube_Dcenter: only keep the center part of the CVC, because of the boundery effect of ConvNet.
-    #     cube_overlapping_ratio: pertantage of the CVC are covered by the neighboring ones
-    #     BB: bounding box, numpy array: [[x_min,x_max],[y_min,y_max],[z_min,z_max]]
-    # outputs:
-    #     cubes_param_np: (N_cubes, N_params) np.float32
-    #     cube_D_mm: scalar
-
-    cube_D_mm = resol * cube_D  # D size of each cube along each axis,
-    cube_Center_D_mm = resol * cube_Dcenter  # D size of each cube's center that is finally remained
-    cube_stride_mm = cube_Center_D_mm * cube_overlapping_ratio  # the distance between adjacent cubes,
-    safeMargin = (cube_D_mm - cube_Center_D_mm) / 2
-
-    print('xyz bounding box of the reconstructed scene: {}, {}, {}'.format(*BB))
-    N_along_axis = lambda _min, _max, _resol: int(math.ceil((_max - _min) / _resol))
-    N_along_xyz = [N_along_axis((BB[_axis][0] - safeMargin), (BB[_axis][1] + safeMargin), cube_stride_mm) for _axis in
-                   range(3)]  # how many cubes along each axis
-    # store the ijk indices of each cube, in order to localize the cube
-    cubes_ijk = np.indices(tuple(N_along_xyz))
-    N_cubes = cubes_ijk.size / 3  # how many cubes
-    N_cubes = int(N_cubes)
-    cubes_param_np = np.empty(((N_cubes),), dtype=[('xyz', np.float32, (3,)), ('ijk', np.int32, (3,)), (
-    'resol', np.float32)])  # attributes for each CVC (colored voxel cube)
-    cubes_param_np['ijk'] = cubes_ijk.reshape([3, -1]).T  # i/j/k grid index
-    cubes_xyz_min = cubes_param_np['ijk'] * cube_stride_mm + (BB[:, 0][None, :] - safeMargin)
-    cubes_param_np['xyz'] = cubes_xyz_min  # x/y/z coordinates (mm)
-    cubes_param_np['resol'] = resol
-
-    return cubes_param_np, cube_D_mm
-
-
-def gen_colored_cubes(position, img, xyz, resol, colorize_cube_D):
-    min_x, min_y, min_z = xyz
-    indx_xyz = range(0, colorize_cube_D)
-    indx_x, indx_y, indx_z = np.meshgrid(indx_xyz, indx_xyz, indx_xyz, indexing='ij')
-    indx_x = indx_x * resol + min_x
-    indx_y = indx_y * resol + min_y
-    indx_z = indx_z * resol + min_z
-    homogen_1s = np.ones(colorize_cube_D ** 3, dtype=np.float64)
-    pts_4D = np.vstack([indx_x.flatten(), indx_y.flatten(), indx_z.flatten(), homogen_1s])
-    homo = np.zeros(4, dtype=np.float64)
-    homo[3] = 1
-    position = np.vstack([position, homo])
-    # colored_cube = np.zeros((3, colorize_cube_D, colorize_cube_D, colorize_cube_D))
-
-    # perspective projection
-    projection_M = position
-    pts_3D = projection_M @ pts_4D  # (4,4) * (4, colorize_cube_D ***3)
-    pts_3D = pts_3D[:-1]
-    pts_3D[:-1] /= pts_3D[-1]  # the result is vector: [w,h,1], w is the first dim
-    pts_2D = pts_3D[:-1].round().astype(np.int32)
-    pts_w, pts_h = pts_2D[0], pts_2D[1]
-    # access rgb of corresponding model_img using pts_2D coordinates
-    pts_RGB = np.zeros((colorize_cube_D ** 3, 3))
-    max_h, max_w, _ = img.shape
-    inScope_pts_indx = (pts_w < max_w) & (pts_h < max_h) & (pts_w >= 0) & (pts_h >= 0)
-    pts_RGB[inScope_pts_indx] = img[pts_h[inScope_pts_indx], pts_w[inScope_pts_indx]]
-    colored_cube = pts_RGB.T.reshape((3, colorize_cube_D, colorize_cube_D, colorize_cube_D))
-
-    return colored_cube  # [views_N, 3, colorize_cube_D, colorize_cube_D, colorize_cube_D]
-
-
-def gen_colored_cubes_viewpair(selected_viewPairs, xyz, resol, cameraPOs, models_img, colorize_cube_D,
-                               visualization_ON=False, \
-                               occupiedCubes_01=None):
-    # inputs:
-    # selected_viewPairs: (N_cubes, N_select_viewPairs, 2)
-    # xyz, resol: parameters for each occupiedCubes (N,params)
-    # occupiedCubes_01: multiple occupiedCubes (N,)+(colorize_cube_D,)*3
-    # return:
-    # coloredCubes = (N*N_select_viewPairs,3*2)+(colorize_cube_D,)*3
-
-    N_cubes, N_select_viewPairs = selected_viewPairs.shape[:2]
-    coloredCubes = np.zeros((N_cubes, N_select_viewPairs * 2, 3) + (colorize_cube_D,) * 3,
-                            dtype=np.float32)  # reshape at the end
-
-    for _n_cube in range(0, N_cubes):  ## each cube
-        if visualization_ON:
-            if occupiedCubes_01 is None:
-                print
-                'error: [func]gen_coloredCubes, occupiedCubes_01 should not be None when visualization_ON==True'
-            occupiedCube_01 = occupiedCubes_01[_n_cube]
-        else:
-            occupiedCube_01 = None
-        ##randViewIndx = random.sample(range(1,cameraPOs.shape[0]),N_randViews)
-
-        # (N_cubes, N_select_viewPairs, 2) ==> (N_select_viewPairs*2,).
-        selected_views = selected_viewPairs[_n_cube].flatten()
-        # because selected_views could include duplicated views, this case is not the best way. But if the N_select_viewPairs is small, it doesn't matter too much
-        coloredCube = gen_colored_cubes(view_set=selected_views, \
-                                        position=cameraPOs, imgs=models_img, xyz=xyz[_n_cube],
-                                        resol=resol[_n_cube], \
-                                        visualization_ON=visualization_ON, colorize_cube_D=colorize_cube_D,
-                                        densityCube=occupiedCube_01)
-
-        coloredCubes[_n_cube] = coloredCube
-
-    return coloredCubes.reshape((N_cubes * N_select_viewPairs, 3 * 2) + (colorize_cube_D,) * 3)

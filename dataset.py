@@ -1,34 +1,52 @@
 import os
+import pickle
+
 from PIL import Image
 from torch.utils.data import Dataset
 import numpy as np
 import utils
-
-
-class DTUdataset(Dataset):
-    def __init__(self, img_dir, pos_dir, target_dir, bbox_dir, resol, size):
-        self.img_dir = img_dir
-        self.pos_dir = pos_dir
-        self.target_dir = target_dir
-        self.bbox_dir = bbox_dir
-        self.imgs = os.listdir(img_dir)
-        self.poses = os.listdir(pos_dir)
-        self.bboxs = os.listdir(bbox_dir)
-        self.resol = resol
-        self.size = size
+import os
+import pickle
+import cv2
+from utils import *
+class ScanNet(Dataset):
+    def __init__(self, scene, data_path, max_depth):
+        self.scene = scene
+        self.data_path = data_path
+        self.max_depth = max_depth
+        self.n_imgs = len(sorted(os.listdir(os.path.join(self.data_path, 'scans', scene, 'color'))))
+        self.id_list = [i for i in range(self.n_imgs)]
+        self.intr = np.loadtxt(os.path.join(self.data_path, 'scans', scene, 'intrinsic', 'intrinsic_color.txt'),
+                               delimiter=' ')[:3, :3]
+        with open(os.path.join(self.data_path, 'tsdf', scene, 'tsdf_info.pkl'), 'rb') as f:
+            self.tsdf_info = pickle.load(f)
+        self.voxel_size = self.tsdf_info['voxel_size']
+        self.vol_bounds = self.tsdf_info['vol_bounds']
+        self.gt = np.load(os.path.join(data_path,'tsdf',scene,'occ.npz'))['arr_0']
 
     def __len__(self):
-        return len(self.imgs)
+        return self.n_imgs
 
     def __getitem__(self, index):
-        # TODO: add gt value
-        img_path = os.path.join(self.image_dir, self.imgs[index])
-        pos_path = os.path.join(self.pos_dir, self.poses[index])
-        bbox_path = os.path.join(self.bbox, self.poses[index])
-        image = np.array(Image.open(img_path)) / 255
-        position = np.loadtxt(pos_path)
-        bbox = np.loadtxt(bbox_path)  # np.array,  (2,3)
-        colored_cube = utils.gen_colored_cubes(position, image, (bbox[0, 0], bbox[0, 1], bbox[0, 2]), self.resol,
-                                               self.size)
+        # print(index)
+        index = self.id_list[index]
+        # get camera pose
+        cam_pose = np.loadtxt(os.path.join(self.data_path,'scans', self.scene, 'pose', str(index) + '.txt'), delimiter=' ')
+        # assert cam_pose.shape == (4, 4)
 
-        return colored_cube
+        # get depth image
+        depth_image = cv2.imread(os.path.join(self.data_path, 'scans',self.scene, 'depth', str(index) + '.png'), -1).astype(
+            np.float32)
+        depth_image /= 1000.
+        depth_image[depth_image > self.max_depth] = 0
+
+        # get rgb image
+        color_image = cv2.imread(os.path.join(self.data_path, 'scans',self.scene, 'color', str(index) + '.jpg'))
+        color_image = cv2.cvtColor((color_image), cv2.COLOR_BGR2RGB)
+        color_image = cv2.resize(color_image, (depth_image.shape[1], depth_image.shape[0]),
+                                 interpolation=cv2.INTER_AREA)  # a little confused about the size --> it's right
+
+        # assert color_image.shape[:-1] == depth_image.shape and color_image.shape[-1] == 3
+        cvc = get_CVC(color_image,self.intr,cam_pose,self.vol_bounds,self.voxel_size,voxel_dim=64)
+        #return cam_pose, depth_image, color_image
+        return cvc

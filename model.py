@@ -55,6 +55,7 @@ class SurfaceNet(nn.Module):
         self.upconv2 = nn.ConvTranspose3d(features[1], 16, 1, stride=4, padding=0, output_padding=3) #four times size
         self.upconv3 = nn.ConvTranspose3d(features[2], 16, 1, stride=4, padding=0, output_padding=3) #four times size
         self.upconv4 = nn.ConvTranspose3d(features[3], 16, 1, stride=4, padding=0, output_padding=3) #four times size
+        self.sigmoid = nn.Sigmoid()
 
     def forward(self,x):
 
@@ -77,10 +78,11 @@ class SurfaceNet(nn.Module):
         #print("shape of s5:{}".format(s5.shape))
         s5 = self.l5(s5)
         output = self.y(s5)
+        output = self.sigmoid(output)
         return output
 
 if __name__ == '__main__':
-    x = torch.rand(1, 6, 32, 32, 32)
-    testnet = SurfaceNet(6,1)
+    x = torch.rand(1,30, 64, 64, 64)
+    testnet = SurfaceNet(30,1)
     x = testnet(x)
     print(x.shape)

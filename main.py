@@ -4,7 +4,7 @@ from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
 from model import SurfaceNet
-from dataset import DTUdataset
+from dataset import ScanNet
 from torch.utils.data import DataLoader
 from utils import save_checkpoint, load_checkpoint
 
