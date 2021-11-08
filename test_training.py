@@ -2,6 +2,7 @@ import os
 import sys
 
 import numpy as np
+import torch.cuda
 
 sys.path.append('.')
 
@@ -30,9 +31,9 @@ def parse_args():
 
 args = parse_args()
 epochs = 120
-
+DEVICE = 'cuda ' if torch.cuda.is_available() else 'cpu'
 if __name__ == '__main__':
-    model = SurfaceNet(30,1)
+    model = SurfaceNet(30,1).to(DEVICE)
     optimizer = optim.Adam(model.parameters(),lr=0.005)
     dataset = ScanNet('scene0000_00',args.data_path,args.max_depth)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=None,batch_sampler=None)
@@ -46,11 +47,11 @@ if __name__ == '__main__':
             CVC = torch.cat((CVC,cvc),axis=0)
         print("concatenating: {}/{}".format(id+1,10))
     CVC = CVC.unsqueeze(0)
-    CVC = CVC.float()
+    CVC = CVC.float().to(DEVICE)
     gt = torch.tensor(dataset.gt)
     gt = gt.unsqueeze(0)
     gt = gt.unsqueeze(0)
-    gt = gt.float()
+    gt = gt.float().to(DEVICE)
     print("training start")
     for epoch in range(epochs):
         pred = model(CVC)
@@ -66,6 +67,6 @@ if __name__ == '__main__':
     plt.ylabel("loss")
     plt.show()
     result = model(CVC)
-    result = result.detach().numpy()
+    result = result.detach().cpu().numpy()
     np.savez_compressed(os.path.join(args.data_path, 'result','trainig_result'), result)
 
