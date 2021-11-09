@@ -31,7 +31,7 @@ args = parse_args()
 LEARNING_RATE = 1e-3
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 BATCH_SIZE = 1
-NUM_EPOCHS = 1
+NUM_EPOCHS = 20
 NUM_WORKERS = 0
 TRAIN_IMG_DIR = ''
 TRAIN_POS_DIR = ''
@@ -42,7 +42,7 @@ VAL_BBOX_DIR = ''
 LOAD_MODEL = False
 if __name__ == '__main__':
     writer = SummaryWriter('./runs')
-    model = SurfaceNet(30,1).to(DEVICE)
+    model = SurfaceNet(410,1).to(DEVICE)
     optimizer = optim.Adam(model.parameters(),lr=0.005)
     dataset_train = ScanNet('scene0000_00',args.data_path,args.max_depth,train=True)
     dataset_val = ScanNet('scene0000_00',args.data_path,args.max_depth,train=False)
@@ -54,6 +54,7 @@ if __name__ == '__main__':
             #print('forward!')
             pred = model(color_image,info)
             optimizer.zero_grad()
+            gt = gt.float()
             loss = loss_fn(pred,gt)
             loss.backward()
             optimizer.step()
