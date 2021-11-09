@@ -57,9 +57,18 @@ class SurfaceNet(nn.Module):
         self.upconv4 = nn.ConvTranspose3d(features[3], 16, 1, stride=4, padding=0, output_padding=3) #four times size
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self,x):
-
-        x1 = self.l1(x)  #s ->s
+    def forward(self,x,info):
+        cvc_list =[]
+        x = x.squeeze(0)
+        for i in range(10):
+            image = x[i,:]
+            volume = CVC(info["vol_bonds"],info['voxel_size'])
+            volume.integrate(image,info['intr'],info['cam_pose'][i])
+            cvc = volume.get_cvc()
+            cvc_list.append(cvc)
+        cvc_integrated = torch.cat(cvc_list,axis=0)
+        cvc_integrated = cvc_integrated.unsqueeze(0)
+        x1 = self.l1(cvc_integrated)  #s ->s
         x1 = self.pool(x1) # s->s/2
         s1 = self.upconv1(x1) # s/2 -> s
         #print("shape of x:{},shape of s:{}".format(x1.shape,s1.shape))
@@ -80,6 +89,125 @@ class SurfaceNet(nn.Module):
         output = self.y(s5)
         output = self.sigmoid(output)
         return output
+
+
+
+
+
+class CVC:
+    def __init__(self, vol_bonds, voxel_size, margin=5):
+        """Constructor.
+
+        Args:
+          vol_bnds (ndarray): An ndarray of shape (3, 2). Specifies the
+            xyz bounds (min/max) in meters.
+          voxel_size (float): The volume discretization in meters.
+        """
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # Define voxel volume parameters
+        #print(vol_bonds.shape)
+        self._vol_bonds = vol_bonds.squeeze(0)
+        self._voxel_size = voxel_size
+        self._sdf_trunc = margin * self._voxel_size
+        self._const = 256 * 256
+        self._integrate_func = integrate
+
+        # Adjust volume bounds
+        self._vol_dim = torch.tensor([64, 64, 64]).long()
+        self._vol_origin = self._vol_bonds[:, 0]
+
+        # Get voxel grid coordinates
+        xv, yv, zv = torch.meshgrid(
+            torch.arange(0, self._vol_dim[0]),
+            torch.arange(0, self._vol_dim[1]),
+            torch.arange(0, self._vol_dim[2]),
+        )
+        self._vox_coords = torch.stack([xv.flatten(), yv.flatten(), zv.flatten()], dim=1).long().to(self.device)
+
+        # Convert voxel coordinates to world coordinates
+        self._world_c = self._vol_origin + (self._voxel_size * self._vox_coords)
+        self._world_c = torch.cat([
+            self._world_c, torch.ones(len(self._world_c), 1, device=self.device)], dim=1)
+
+        self.reset()
+
+        # print("[*] voxel volume: {} x {} x {}".format(*self._vol_dim))
+        # print("[*] num voxels: {:,}".format(self._num_voxels))
+
+    def reset(self):
+        self.cvc = torch.ones(3,64,64,64).to(self.device)
+        # self._weight_vol = torch.zeros(*self._vol_dim).to(self.device)
+        # self._color_vol = torch.zeros(*self._vol_dim).to(self.device)
+        # self._occ_vol = torch.zeros(*self._vol_dim).to(self.device)
+
+    def integrate(self, color_im, cam_intr, cam_pose):
+        """Integrate an RGB-D frame into the TSDF volume.
+        Args:
+          color_im (ndarray): An RGB image of shape (H, W, 3).
+          cam_intr (ndarray): The camera intrinsics matrix of shape (3, 3).
+          cam_pose (ndarray): The camera pose (i.e. extrinsics) of shape (4, 4).
+          obs_weight (float): The weight to assign to the current observation.
+        """
+        cam_pose = cam_pose.clone().detach().float().to(self.device)
+        cam_intr = cam_intr.clone().detach().float().to(self.device)
+        color_im = color_im.clone().detach().float().to(self.device)
+        im_h, im_w,_ = color_im.shape
+        cvc= self._integrate_func(
+            cam_intr,
+            cam_pose,
+            color_im,
+            self._world_c,
+            self._vox_coords,
+            self.cvc,
+            im_h, im_w,
+        )
+        self.cvc = cvc
+
+
+    def get_cvc(self):
+        return self.cvc
+
+    @property
+    def sdf_trunc(self):
+        return self._sdf_trunc
+
+    @property
+    def voxel_size(self):
+        return self._voxel_size
+def integrate(
+        cam_intr,
+        cam_pose,
+        color_im,
+        world_c,
+        vox_coords,
+        cvc,
+        im_h,
+        im_w,
+):
+    # Convert world coordinates to camera coordinates
+    cam_pose = cam_pose.squeeze(0)
+    world2cam = torch.inverse(cam_pose)
+    cam_c = torch.matmul(world2cam.float(), world_c.float().transpose(1, 0)).transpose(1, 0).float()
+    cam_intr = cam_intr.squeeze(0)
+    # Convert camera coordinates to pixel coordinates
+    fx, fy = cam_intr[0, 0], cam_intr[1, 1]
+    cx, cy = cam_intr[0, 2], cam_intr[1, 2]
+    pix_z = cam_c[:, 2]
+    pix_x = torch.round((cam_c[:, 0] * fx / cam_c[:, 2]) + cx).long()
+    pix_y = torch.round((cam_c[:, 1] * fy / cam_c[:, 2]) + cy).long()
+
+    # Eliminate pixels outside view frustum
+    valid_pix = (pix_x >= 0) & (pix_x < im_w) & (pix_y >= 0) & (pix_y < im_h) & (pix_z > 0)
+    rgb_val = torch.zeros(len(pix_x),3).to('cuda')
+    rgb_val[valid_pix] = color_im[pix_y[valid_pix], pix_x[valid_pix]]
+    rgb_val_valid = rgb_val[valid_pix]
+    # assign rgb value
+    valid_vox_x = vox_coords[valid_pix, 0]
+    valid_vox_y = vox_coords[valid_pix, 1]
+    valid_vox_z = vox_coords[valid_pix, 2]
+    cvc[:,valid_vox_x,valid_vox_y,valid_vox_z] = rgb_val_valid.reshape(3,-1)
+    return cvc
 
 if __name__ == '__main__':
     x = torch.rand(1,30, 64, 64, 64)

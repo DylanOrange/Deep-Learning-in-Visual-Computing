@@ -1,18 +1,37 @@
+import os
+import sys
 import numpy as np
-import torch
+import torch.cuda
+sys.path.append('.')
+from tools.fusion  import *
+import pickle
+import argparse
 from tqdm import tqdm
-import torch.nn as nn
+from dataset import *
+from torch.utils.data import DataLoader
+from utils import *
 import torch.optim as optim
 from model import SurfaceNet
-from dataset import ScanNet
-from torch.utils.data import DataLoader
-from utils import save_checkpoint, load_checkpoint
-
+import matplotlib.pyplot as plt
+import tensorboard
+from torch.utils.tensorboard import SummaryWriter
+def parse_args():
+    parser = argparse.ArgumentParser(description='Generation of Ground Truth')
+    parser.add_argument("--data_path", metavar="DIR", help='path to raw data', default='./scannet')
+    parser.add_argument("--save_name", metavar="DIR", help="file name", default="tsdf")
+    parser.add_argument("--max_depth", default=3, type=int)
+    parser.add_argument("--margin", default=3, type=int)
+    parser.add_argument("--voxel_size", default=0.04, type=float)
+    parser.add_argument("--window_size", default=9, type=int)
+    parser.add_argument("--min_angle", default=15, type=float)
+    parser.add_argument("--min_distance", default=0.1, type=float)
+    return parser.parse_args()
+args = parse_args()
 # Hyperparameters
-LEARNING_RATE = 1E-4
+LEARNING_RATE = 1e-3
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-BATCH_SIZE = 16
-NUM_EPOCHS = 3
+BATCH_SIZE = 1
+NUM_EPOCHS = 1
 NUM_WORKERS = 0
 TRAIN_IMG_DIR = ''
 TRAIN_POS_DIR = ''
@@ -21,39 +40,46 @@ VAL_IMG_DIR = ''
 VAL_POS_DIR = ''
 VAL_BBOX_DIR = ''
 LOAD_MODEL = False
-# training
-train_dataset = DataLoader(DTUdataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, shuffle=True)
-model = SurfaceNet().to(device=DEVICE)
-loop = tqdm(train_dataset)
-loss_fn = nn.BCELoss()
-optimizer = optim.Adam(model.parameters(),lr = LEARNING_RATE)
-loss=[]
-for epoch in range(NUM_EPOCHS):
-    temp_loss=[]
-    for batch, (colored_cube, targets) in enumerate(loop):
-        # forward
-        colored_cube = colored_cube.to(device=DEVICE)
-        targets = targets.to(device=DEVICE)
-        prediction = model(colored_cube)
-        loss = loss_fn(prediction, targets)
-        # backward
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        temp_loss.append(loss.item())
-    avg_loss = np.average(temp_loss)
-    loss.append(avg_loss)
-    checkpoint = {
-        "state_dict":model.state_dict(),
-        "optimizer":optimizer.state_dict()
-    }
-    filename = 'checkpoint_' + str(epoch) +'_.pth.tar'
-    save_checkpoint(checkpoint,filename=filename)
+if __name__ == '__main__':
+    writer = SummaryWriter('./runs')
+    model = SurfaceNet(30,1).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(),lr=0.005)
+    dataset_train = ScanNet('scene0000_00',args.data_path,args.max_depth,train=True)
+    dataset_val = ScanNet('scene0000_00',args.data_path,args.max_depth,train=False)
+    dataloader_train = torch.utils.data.DataLoader(dataset_train, batch_size=1)
+    loss_fn = torch.nn.BCELoss()
+    print('start training')
+    for epoch in range(NUM_EPOCHS):
+        for i, (color_image,info,gt) in enumerate(dataloader_train):
+            #print('forward!')
+            pred = model(color_image,info)
+            optimizer.zero_grad()
+            loss = loss_fn(pred,gt)
+            loss.backward()
+            optimizer.step()
+            #print('finish backward!')
+            writer.add_scalar('Training loss',
+                              loss.item(),
+                              epoch * len(dataloader_train) + i)
+        # see validation loss
+            model.eval()
+            random = np.random.randint(0,40)
+            color_image,info,gt = dataset_val[random]
+            pred = model(color_image,info)
+            gt = gt.unsqueeze(0)
+            with torch.no_grad():
+                val_loss = loss_fn(pred,gt)
+            writer.add_scalar('Validation loss',
+                                  val_loss.item(),
+                                  epoch * len(dataloader_train) + i)
+            
+            model.train()
+            
+            
+            print('epoch:{}/{}, iteration:{}/{}, loss:{}, val_loss:{}'.format(epoch,NUM_EPOCHS,i,len(dataloader_train),loss.item(),val_loss.item()))
+    print('end training')
 
-    if (epoch+1)%20 == 0:
-        print("epoch: {} , avg loss: {} ".format(epoch,np.average(loss)))
 
-print("Finished Training")
 
 
 
